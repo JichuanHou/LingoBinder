@@ -1,3 +1,4 @@
+
 export interface Segment {
   id: string;
   type: 'text' | 'image';
@@ -32,7 +33,14 @@ export interface ParsedBook {
   coverUrl?: string;
   chapters: ChapterRef[];
   toc: TocItem[]; // Hierarchical Table of Contents
-  files: Record<string, Blob>; // Internal storage of unzipped files
+}
+
+export interface LibraryBook {
+  id: string;
+  title: string;
+  author: string;
+  cover?: Blob;
+  addedAt: number;
 }
 
 export enum TargetLanguage {
@@ -46,6 +54,15 @@ export enum TargetLanguage {
   PORTUGUESE = 'Portuguese',
   RUSSIAN = 'Russian',
   HINDI = 'Hindi'
+}
+
+export type AIProvider = 'gemini' | 'openai';
+
+export interface AISettings {
+  provider: AIProvider;
+  apiKey: string; // For OpenAI / Custom
+  baseUrl: string; // For OpenAI / Custom
+  model: string;
 }
 
 // Gemini API Types

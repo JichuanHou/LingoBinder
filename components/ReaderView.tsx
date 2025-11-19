@@ -1,21 +1,33 @@
+
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { ChevronLeft, ChevronRight, Globe, Loader2, ArrowLeft, List, X, AlertCircle, Settings, Minus, Plus, Moon, Sun, Coffee } from 'lucide-react';
-import { ParsedBook, Segment, TargetLanguage, TocItem } from '../types';
+import { ChevronLeft, ChevronRight, Globe, Loader2, ArrowLeft, List, X, AlertCircle, Settings, Minus, Plus, Moon, Sun, Coffee, Search, Server, Key, PauseCircle } from 'lucide-react';
+import { ParsedBook, Segment, TargetLanguage, TocItem, AISettings } from '../types';
 import { parseChapterContent } from '../services/epubParser';
 import { translateSegmentsBatch } from '../services/geminiService';
+import { db } from '../services/db';
+import JSZip from 'jszip';
 
 interface ReaderViewProps {
+  bookId: string;
   book: ParsedBook;
+  epubFile: Blob;
   onBack: () => void;
 }
 
-const BATCH_SIZE = 10; // Number of paragraphs to translate at once
+// Increased to save tokens on system prompts per request
+const BATCH_SIZE = 30; 
 
-// Settings Interfaces
 interface ReaderSettings {
   fontSize: number;
   fontFamily: 'font-serif' | 'font-sans' | 'font-mono';
   theme: 'light' | 'sepia' | 'dark';
+}
+
+interface SearchResult {
+    chapterIndex: number;
+    chapterTitle: string;
+    segmentId: string;
+    snippet: string;
 }
 
 const DEFAULT_SETTINGS: ReaderSettings = {
@@ -24,22 +36,42 @@ const DEFAULT_SETTINGS: ReaderSettings = {
   theme: 'light',
 };
 
-export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
+const DEFAULT_AI_SETTINGS: AISettings = {
+  provider: 'gemini',
+  baseUrl: 'https://openrouter.ai/api/v1',
+  apiKey: '',
+  model: 'gemini-2.5-flash'
+};
+
+export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, onBack }) => {
   // Book State
   const [currentChapterIndex, setCurrentChapterIndex] = useState(0);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [isLoadingChapter, setIsLoadingChapter] = useState(false);
   const [targetLang, setTargetLang] = useState<TargetLanguage>(TargetLanguage.CHINESE);
   const [isTranslating, setIsTranslating] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [translationProgress, setTranslationProgress] = useState(0);
+  const [zipInstance, setZipInstance] = useState<JSZip | null>(null);
   
-  // Caching & Refs
-  const chapterCache = useRef<Record<string, Segment[]>>({});
+  // Refs
   const currentChapterRef = useRef<string>('');
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const pendingScrollRef = useRef<string | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // UI State
   const [isTocOpen, setIsTocOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<'view' | 'ai'>('view');
+
+  // Search State
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
 
   // Settings State
   const [settings, setSettings] = useState<ReaderSettings>(() => {
@@ -47,9 +79,39 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
     return saved ? JSON.parse(saved) : DEFAULT_SETTINGS;
   });
 
+  const [aiSettings, setAiSettings] = useState<AISettings>(() => {
+    const saved = localStorage.getItem('lingo-ai-settings');
+    return saved ? JSON.parse(saved) : DEFAULT_AI_SETTINGS;
+  });
+
   const currentChapter = book.chapters[currentChapterIndex];
 
-  // Sync current chapter ID to ref for race-condition checks
+  // Initialize Zip Engine & Restore Progress
+  useEffect(() => {
+    const init = async () => {
+      const zip = new JSZip();
+      try {
+        await zip.loadAsync(epubFile);
+        setZipInstance(zip);
+        
+        // Restore Progress
+        const progress = await db.getProgress(bookId);
+        if (progress) {
+            if (progress.chapterIndex >= 0 && progress.chapterIndex < book.chapters.length) {
+                setCurrentChapterIndex(progress.chapterIndex);
+                if (progress.segmentId) {
+                    pendingScrollRef.current = progress.segmentId.replace('seg-', '');
+                }
+            }
+        }
+      } catch (e) {
+        console.error("Failed to load EPUB or progress", e);
+      }
+    };
+    init();
+  }, [epubFile, bookId, book.chapters.length]);
+
+  // Sync current chapter ID
   useEffect(() => {
     if (currentChapter) {
       currentChapterRef.current = currentChapter.id;
@@ -61,45 +123,122 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
     localStorage.setItem('lingo-reader-settings', JSON.stringify(settings));
   }, [settings]);
 
+  useEffect(() => {
+    localStorage.setItem('lingo-ai-settings', JSON.stringify(aiSettings));
+  }, [aiSettings]);
+
+  // Auto-scroll to pending segment after segments load
+  useEffect(() => {
+    if (pendingScrollRef.current && !isLoadingChapter && segments.length > 0) {
+        const scrollTargetId = `seg-${pendingScrollRef.current}`;
+        
+        const attemptScroll = (delay: number) => {
+            setTimeout(() => {
+                const element = document.getElementById(scrollTargetId);
+                if (element) {
+                    element.scrollIntoView({ behavior: 'auto', block: 'center' });
+                    element.classList.add('bg-yellow-200/30', 'transition-colors', 'duration-1000');
+                    setTimeout(() => {
+                        element.classList.remove('bg-yellow-200/30');
+                    }, 2000);
+                }
+            }, delay);
+        };
+
+        attemptScroll(0);
+        attemptScroll(100);
+        attemptScroll(500);
+
+        setTimeout(() => {
+            pendingScrollRef.current = null;
+        }, 1000);
+    }
+  }, [segments, isLoadingChapter]);
+
+  const cleanupResources = useCallback((segmentList: Segment[]) => {
+    segmentList.forEach(seg => {
+      if (seg.imageUrl) {
+        URL.revokeObjectURL(seg.imageUrl);
+      }
+    });
+  }, []);
+
   // Load Chapter Content
   useEffect(() => {
-    const loadChapter = async () => {
-      if (!currentChapter) return;
-      
-      // 1. Check Cache
-      if (chapterCache.current[currentChapter.href]) {
-        setSegments(chapterCache.current[currentChapter.href]);
-        setIsLoadingChapter(false);
-        return;
-      }
+    let active = true; 
 
-      // 2. Parse if not cached
+    const loadChapter = async () => {
+      if (!currentChapter || !zipInstance) return;
+      
+      cleanupResources(segments);
       setIsLoadingChapter(true);
-      setSegments([]);
+      setSegments([]); 
+      
+      if (abortControllerRef.current) {
+          abortControllerRef.current.abort();
+          abortControllerRef.current = null;
+          setIsTranslating(false);
+          setIsStopping(false);
+      }
       
       try {
-        const extractedSegments = await parseChapterContent(book, currentChapter);
-        setSegments(extractedSegments);
-        // Cache the initial untranslated state
-        chapterCache.current[currentChapter.href] = extractedSegments;
+        const extractedSegments = await parseChapterContent(zipInstance, currentChapter, 'full');
+        
+        if (!active) {
+            cleanupResources(extractedSegments);
+            return;
+        }
+
+        const savedTranslations = await db.getTranslations(bookId, currentChapter.href);
+        
+        if (!active) return;
+
+        const mergedSegments = extractedSegments.map(seg => {
+          if (savedTranslations[seg.id]) {
+            return { ...seg, translatedText: savedTranslations[seg.id] };
+          }
+          return seg;
+        });
+
+        setSegments(mergedSegments);
       } catch (e) {
-        console.error("Failed to load chapter", e);
+        if (active) console.error("Failed to load chapter", e);
       } finally {
-        setIsLoadingChapter(false);
+        if (active) setIsLoadingChapter(false);
       }
     };
 
     loadChapter();
-  }, [currentChapter, book]);
+    
+    return () => {
+       active = false;
+    };
+  }, [currentChapter, book, bookId, zipInstance]);
+
+  useEffect(() => {
+      return () => {
+          cleanupResources(segments);
+          if (abortControllerRef.current) {
+              abortControllerRef.current.abort();
+          }
+      };
+  }, []);
 
   // Translation Logic
   const handleTranslate = useCallback(async () => {
     if (segments.length === 0) return;
     
-    // Store the ID of the chapter we started translating
-    const translationChapterId = currentChapter.id;
+    // Stop any existing process
+    if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+    }
+    
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
+    const translationChapterId = currentChapter.id;
     setIsTranslating(true);
+    setIsStopping(false);
     setTranslationProgress(0);
 
     const segmentsToTranslate = segments.filter(s => s.type === 'text' && !s.translatedText);
@@ -108,83 +247,206 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
     let completedBatches = 0;
     let currentSegments = [...segments];
 
-    for (let i = 0; i < segmentsToTranslate.length; i += BATCH_SIZE) {
-      // Safety Check: Stop if user switched chapters
-      if (currentChapterRef.current !== translationChapterId) {
-        break;
-      }
+    try {
+        for (let i = 0; i < segmentsToTranslate.length; i += BATCH_SIZE) {
+          if (controller.signal.aborted) break;
+          if (currentChapterRef.current !== translationChapterId) break;
 
-      const batch = segmentsToTranslate.slice(i, i + BATCH_SIZE);
-      const texts = batch.map(s => s.originalText);
-      
-      // Mark as loading in UI
-      const batchIds = new Set(batch.map(b => b.id));
-      setSegments(prev => prev.map(s => batchIds.has(s.id) ? { ...s, isLoading: true } : s));
+          const batch = segmentsToTranslate.slice(i, i + BATCH_SIZE);
+          const texts = batch.map(s => s.originalText);
+          
+          const batchIds = new Set(batch.map(b => b.id));
+          setSegments(prev => prev.map(s => batchIds.has(s.id) ? { ...s, isLoading: true } : s));
 
-      // Call API
-      const translations = await translateSegmentsBatch(texts, targetLang);
+          // Pass aiSettings AND the abort signal to service
+          const translations = await translateSegmentsBatch(texts, targetLang, aiSettings, controller.signal);
 
-      // Safety Check again after async call
-      if (currentChapterRef.current !== translationChapterId) {
-        break;
-      }
+          if (controller.signal.aborted) break;
+          if (currentChapterRef.current !== translationChapterId) break;
 
-      // Update segments with results
-      currentSegments = currentSegments.map(s => {
-        if (batchIds.has(s.id)) {
-          const indexInBatch = batch.findIndex(b => b.id === s.id);
-          return { 
-            ...s, 
-            translatedText: translations[indexInBatch], 
-            isLoading: false 
-          };
+          currentSegments = currentSegments.map(s => {
+            if (batchIds.has(s.id)) {
+              const indexInBatch = batch.findIndex(b => b.id === s.id);
+              return { 
+                ...s, 
+                translatedText: translations[indexInBatch], 
+                isLoading: false 
+              };
+            }
+            return s;
+          });
+
+          setSegments([...currentSegments]); 
+          
+          if (currentChapter) {
+            await db.saveTranslations(bookId, currentChapter.href, currentSegments);
+          }
+
+          completedBatches++;
+          setTranslationProgress(Math.round((completedBatches / totalBatches) * 100));
+
+          // Small delay between batches to breathe, unless last batch
+          if (i + BATCH_SIZE < segmentsToTranslate.length) {
+            try {
+                // Using a loop for interruptible delay
+                for (let d = 0; d < 5; d++) { 
+                    if (controller.signal.aborted) throw new Error("Aborted");
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
+            } catch (e) {
+                break; // Break loop on abort
+            }
+          }
         }
-        return s;
-      });
-
-      setSegments([...currentSegments]); 
-      
-      // Update Cache with new translations
-      if (currentChapter) {
-        chapterCache.current[currentChapter.href] = [...currentSegments];
-      }
-
-      completedBatches++;
-      setTranslationProgress(Math.round((completedBatches / totalBatches) * 100));
+    } catch (error: any) {
+        if (error.message === "Aborted") {
+            console.log("Translation stopped by user.");
+        } else {
+            console.error("Translation Error", error);
+        }
+    } finally {
+        // Only reset state if WE are still the active controller
+        if (abortControllerRef.current === controller) {
+            // Clean up loading states if aborted
+            if (controller.signal.aborted) {
+                setSegments(prev => prev.map(s => s.isLoading ? { ...s, isLoading: false } : s));
+            }
+            setIsTranslating(false);
+            setIsStopping(false);
+            abortControllerRef.current = null;
+        }
     }
+  }, [segments, targetLang, currentChapter, bookId, aiSettings]);
 
-    setIsTranslating(false);
-  }, [segments, targetLang, currentChapter]);
+  const handleStopTranslation = () => {
+      if (abortControllerRef.current) {
+          setIsStopping(true);
+          abortControllerRef.current.abort();
+      }
+  };
+
+  // Search Logic
+  const performSearch = async () => {
+      if (!searchQuery.trim() || !zipInstance) return;
+      
+      setIsSearching(true);
+      setSearchResults([]);
+      
+      const queryLower = searchQuery.toLowerCase();
+      const results: SearchResult[] = [];
+
+      try {
+          for (let i = 0; i < book.chapters.length; i++) {
+              const chapter = book.chapters[i];
+              const chapterSegments = await parseChapterContent(zipInstance, chapter, 'text-only');
+              
+              for (const seg of chapterSegments) {
+                  if (seg.type === 'text' && seg.originalText.toLowerCase().includes(queryLower)) {
+                      const text = seg.originalText;
+                      const matchIndex = text.toLowerCase().indexOf(queryLower);
+                      const start = Math.max(0, matchIndex - 30);
+                      const end = Math.min(text.length, matchIndex + queryLower.length + 30);
+                      const snippet = (start > 0 ? '...' : '') + text.substring(start, end) + (end < text.length ? '...' : '');
+
+                      results.push({
+                          chapterIndex: i,
+                          chapterTitle: chapter.title || `Chapter ${i + 1}`,
+                          segmentId: seg.id,
+                          snippet: snippet
+                      });
+
+                      if (results.length >= 50) break;
+                  }
+              }
+              if (results.length >= 50) break;
+          }
+          setSearchResults(results);
+      } catch (e) {
+          console.error("Search failed", e);
+      } finally {
+          setIsSearching(false);
+      }
+  };
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent) => {
+      if (e.key === 'Enter') {
+          performSearch();
+      }
+  };
+
+  const handleSearchResultClick = (result: SearchResult) => {
+      setCurrentChapterIndex(result.chapterIndex);
+      pendingScrollRef.current = result.segmentId.replace('seg-', '');
+      setIsSearchOpen(false);
+  };
+
+  // Scroll Tracking
+  const handleScroll = useCallback(() => {
+      if (!scrollContainerRef.current || isLoadingChapter) return;
+      
+      if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+      
+      saveTimeoutRef.current = setTimeout(() => {
+          const container = scrollContainerRef.current;
+          if (!container) return;
+          
+          const containerRect = container.getBoundingClientRect();
+          const offset = 100; 
+          
+          let foundSegmentId = null;
+
+          for (const seg of segments) {
+              const el = document.getElementById(seg.id);
+              if (el) {
+                  const rect = el.getBoundingClientRect();
+                  if (rect.bottom > containerRect.top + offset) {
+                      foundSegmentId = seg.id;
+                      break;
+                  }
+              }
+          }
+
+          if (foundSegmentId) {
+             db.saveProgress(bookId, currentChapterIndex, foundSegmentId).catch(console.error);
+          }
+
+      }, 1000); 
+  }, [bookId, currentChapterIndex, segments, isLoadingChapter]);
+
 
   // Navigation
   const nextChapter = useCallback(() => {
     if (currentChapterIndex < book.chapters.length - 1) {
       setCurrentChapterIndex(prev => prev + 1);
-      window.scrollTo(0, 0);
+      if (scrollContainerRef.current) scrollContainerRef.current.scrollTo(0, 0);
     }
   }, [currentChapterIndex, book.chapters.length]);
 
   const prevChapter = useCallback(() => {
     if (currentChapterIndex > 0) {
       setCurrentChapterIndex(prev => prev - 1);
-      window.scrollTo(0, 0);
+      if (scrollContainerRef.current) scrollContainerRef.current.scrollTo(0, 0);
     }
   }, [currentChapterIndex]);
 
   const handleTocNavigation = (href: string) => {
-    const fileHref = href.split('#')[0];
-    const chapterIndex = book.chapters.findIndex(c => c.href === fileHref || c.href.endsWith(fileHref));
+    const [fileHref] = href.split('#');
+    const chapterIndex = book.chapters.findIndex(c => 
+      c.href === fileHref || 
+      c.href.endsWith(`/${fileHref}`) || 
+      fileHref.endsWith(c.href)
+    );
     
     if (chapterIndex !== -1) {
       setCurrentChapterIndex(chapterIndex);
       setIsTocOpen(false);
-      window.scrollTo(0, 0);
+      if (scrollContainerRef.current) scrollContainerRef.current.scrollTo(0, 0);
     }
   };
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.key === 'ArrowRight') nextChapter();
       else if (e.key === 'ArrowLeft') prevChapter();
     };
@@ -192,8 +454,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [nextChapter, prevChapter]);
 
-  // --- Styling Helpers ---
-
+  // Styling Helpers
   const getThemeColors = () => {
     switch (settings.theme) {
       case 'dark':
@@ -204,19 +465,23 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
           border: 'border-slate-800',
           highlight: 'text-blue-400',
           secondaryText: 'text-slate-500',
-          hover: 'hover:bg-slate-800'
+          hover: 'hover:bg-slate-800',
+          inputBg: 'bg-slate-800',
+          inputText: 'text-white'
         };
       case 'sepia':
         return {
           bg: 'bg-[#f4ecd8]',
-          text: 'text-[#2c2218]', // Darker brown for better readability
+          text: 'text-[#2c2218]', 
           headerBg: 'bg-[#f4ecd8] border-[#e3dccb]',
           border: 'border-[#e3dccb]',
           highlight: 'text-[#8f6b4e]',
           secondaryText: 'text-[#786655]',
-          hover: 'hover:bg-[#e8dec5]'
+          hover: 'hover:bg-[#e8dec5]',
+          inputBg: 'bg-[#e8dec5]',
+          inputText: 'text-[#2c2218]'
         };
-      default: // light
+      default: 
         return {
           bg: 'bg-white',
           text: 'text-slate-800',
@@ -224,7 +489,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
           border: 'border-slate-100',
           highlight: 'text-blue-600',
           secondaryText: 'text-slate-400',
-          hover: 'hover:bg-slate-100'
+          hover: 'hover:bg-slate-100',
+          inputBg: 'bg-slate-100',
+          inputText: 'text-slate-800'
         };
     }
   };
@@ -232,7 +499,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
   const theme = getThemeColors();
 
   const getTagStyles = (tag: string) => {
-    // Base styles without colors (colors handled by container)
     switch (tag) {
       case 'h1': return 'text-3xl font-bold mb-6 mt-8 leading-tight';
       case 'h2': return 'text-2xl font-bold mb-4 mt-6 leading-tight';
@@ -247,7 +513,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
     <div className="w-full">
       <button 
         onClick={() => handleTocNavigation(item.href)}
-        className={`w-full text-left px-4 py-2 text-sm transition-colors truncate ${theme.hover} ${level > 0 ? 'pl-' + (4 + level * 4) : ''}`}
+        className={`w-full text-left px-4 py-2 text-sm transition-colors truncate ${theme.hover}`}
         style={{ paddingLeft: `${1 + level}rem`, color: 'inherit' }}
         title={item.label}
       >
@@ -261,12 +527,21 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
     </div>
   );
 
+  if (!zipInstance) {
+    return (
+      <div className={`h-screen flex flex-col items-center justify-center ${theme.bg} ${theme.text}`}>
+        <Loader2 className="w-8 h-8 animate-spin mb-4" />
+        <p>Initializing Book Reader...</p>
+      </div>
+    );
+  }
+
   return (
     <div className={`flex flex-col h-screen relative transition-colors duration-300 ${theme.bg} ${theme.text}`}>
       {/* Header Toolbar */}
       <header className={`sticky top-0 z-20 shadow-sm px-6 py-3 flex items-center justify-between transition-colors duration-300 ${theme.headerBg}`}>
         <div className="flex items-center gap-4">
-          <button onClick={onBack} className={`p-2 rounded-full transition-colors ${theme.hover}`} title="Back">
+          <button onClick={onBack} className={`p-2 rounded-full transition-colors ${theme.hover}`} title="Back to Library">
             <ArrowLeft size={20} />
           </button>
           
@@ -276,6 +551,17 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
              title="Table of Contents"
           >
              <List size={20} />
+          </button>
+
+          <button 
+             onClick={() => {
+                 setIsSearchOpen(true);
+                 setTimeout(() => searchInputRef.current?.focus(), 100);
+             }}
+             className={`p-2 rounded-full transition-colors ${theme.hover}`}
+             title="Search Book"
+          >
+             <Search size={20} />
           </button>
 
           <div className="flex flex-col">
@@ -307,7 +593,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
             <button 
               onClick={() => setIsSettingsOpen(!isSettingsOpen)}
               className={`p-2 rounded-full transition-colors ${isSettingsOpen ? 'bg-blue-100 text-blue-600' : theme.hover}`}
-              title="Appearance Settings"
+              title="Settings"
             >
               <Settings size={20} />
             </button>
@@ -315,84 +601,167 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
             {isSettingsOpen && (
               <>
               <div className="fixed inset-0 z-10" onClick={() => setIsSettingsOpen(false)} />
-              <div className="absolute right-0 top-full mt-2 w-72 bg-white text-slate-800 rounded-xl shadow-xl border border-slate-200 p-4 z-20 animate-in fade-in zoom-in-95 duration-100">
+              <div className="absolute right-0 top-full mt-2 w-80 bg-white text-slate-800 rounded-xl shadow-xl border border-slate-200 z-20 animate-in fade-in zoom-in-95 duration-100 overflow-hidden">
                 
-                {/* Font Size */}
-                <div className="mb-4">
-                  <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 block">Font Size</label>
-                  <div className="flex items-center justify-between bg-slate-100 rounded-lg p-1">
+                {/* Tabs */}
+                <div className="flex border-b border-slate-100">
                     <button 
-                      onClick={() => setSettings(s => ({ ...s, fontSize: Math.max(12, s.fontSize - 2) }))}
-                      className="p-2 hover:bg-white rounded shadow-sm text-slate-600 disabled:opacity-50"
-                      disabled={settings.fontSize <= 12}
+                        onClick={() => setSettingsTab('view')}
+                        className={`flex-1 py-2 text-sm font-medium ${settingsTab === 'view' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-500 hover:bg-slate-50'}`}
                     >
-                      <Minus size={16} />
+                        Appearance
                     </button>
-                    <span className="font-medium text-sm w-12 text-center">{settings.fontSize}px</span>
                     <button 
-                      onClick={() => setSettings(s => ({ ...s, fontSize: Math.min(32, s.fontSize + 2) }))}
-                      className="p-2 hover:bg-white rounded shadow-sm text-slate-600 disabled:opacity-50"
-                      disabled={settings.fontSize >= 32}
+                        onClick={() => setSettingsTab('ai')}
+                        className={`flex-1 py-2 text-sm font-medium ${settingsTab === 'ai' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-slate-500 hover:bg-slate-50'}`}
                     >
-                      <Plus size={16} />
+                        AI Settings
                     </button>
-                  </div>
                 </div>
 
-                {/* Font Family */}
-                <div className="mb-4">
-                   <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 block">Typeface</label>
-                   <div className="flex gap-2">
-                      <button 
-                        onClick={() => setSettings(s => ({ ...s, fontFamily: 'font-serif' }))}
-                        className={`flex-1 py-2 text-sm font-serif border rounded-md transition-colors ${settings.fontFamily === 'font-serif' ? 'bg-blue-50 border-blue-500 text-blue-700' : 'border-slate-200 hover:bg-slate-50'}`}
-                      >
-                        Serif
-                      </button>
-                      <button 
-                        onClick={() => setSettings(s => ({ ...s, fontFamily: 'font-sans' }))}
-                        className={`flex-1 py-2 text-sm font-sans border rounded-md transition-colors ${settings.fontFamily === 'font-sans' ? 'bg-blue-50 border-blue-500 text-blue-700' : 'border-slate-200 hover:bg-slate-50'}`}
-                      >
-                        Sans
-                      </button>
-                      <button 
-                        onClick={() => setSettings(s => ({ ...s, fontFamily: 'font-mono' }))}
-                        className={`flex-1 py-2 text-sm font-mono border rounded-md transition-colors ${settings.fontFamily === 'font-mono' ? 'bg-blue-50 border-blue-500 text-blue-700' : 'border-slate-200 hover:bg-slate-50'}`}
-                      >
-                        Mono
-                      </button>
-                   </div>
-                </div>
+                <div className="p-4">
+                  {settingsTab === 'view' ? (
+                    <div className="space-y-4">
+                        <div>
+                        <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 block">Font Size</label>
+                        <div className="flex items-center justify-between bg-slate-100 rounded-lg p-1">
+                            <button 
+                            onClick={() => setSettings(s => ({ ...s, fontSize: Math.max(12, s.fontSize - 2) }))}
+                            className="p-2 hover:bg-white rounded shadow-sm text-slate-600 disabled:opacity-50"
+                            disabled={settings.fontSize <= 12}
+                            >
+                            <Minus size={16} />
+                            </button>
+                            <span className="font-medium text-sm w-12 text-center">{settings.fontSize}px</span>
+                            <button 
+                            onClick={() => setSettings(s => ({ ...s, fontSize: Math.min(32, s.fontSize + 2) }))}
+                            className="p-2 hover:bg-white rounded shadow-sm text-slate-600 disabled:opacity-50"
+                            disabled={settings.fontSize >= 32}
+                            >
+                            <Plus size={16} />
+                            </button>
+                        </div>
+                        </div>
 
-                {/* Theme */}
-                <div>
-                  <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 block">Theme</label>
-                  <div className="flex gap-2">
-                    <button 
-                      onClick={() => setSettings(s => ({ ...s, theme: 'light' }))}
-                      className={`flex-1 py-3 rounded-md border flex justify-center transition-all ${settings.theme === 'light' ? 'ring-2 ring-blue-500 border-transparent' : 'border-slate-200'}`}
-                      style={{ backgroundColor: '#ffffff', color: '#333' }}
-                      title="Light"
-                    >
-                      <Sun size={20} />
-                    </button>
-                    <button 
-                      onClick={() => setSettings(s => ({ ...s, theme: 'sepia' }))}
-                      className={`flex-1 py-3 rounded-md border flex justify-center transition-all ${settings.theme === 'sepia' ? 'ring-2 ring-blue-500 border-transparent' : 'border-[#e3dccb]'}`}
-                      style={{ backgroundColor: '#f4ecd8', color: '#5b4636' }}
-                      title="Sepia"
-                    >
-                      <Coffee size={20} />
-                    </button>
-                    <button 
-                      onClick={() => setSettings(s => ({ ...s, theme: 'dark' }))}
-                      className={`flex-1 py-3 rounded-md border flex justify-center transition-all ${settings.theme === 'dark' ? 'ring-2 ring-blue-500 border-transparent' : 'border-slate-700'}`}
-                      style={{ backgroundColor: '#1e293b', color: '#cbd5e1' }}
-                      title="Dark"
-                    >
-                      <Moon size={20} />
-                    </button>
-                  </div>
+                        <div>
+                        <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 block">Typeface</label>
+                        <div className="flex gap-2">
+                            {['font-serif', 'font-sans', 'font-mono'].map(font => (
+                                <button 
+                                    key={font}
+                                    onClick={() => setSettings(s => ({ ...s, fontFamily: font as any }))}
+                                    className={`flex-1 py-2 text-sm border rounded-md transition-colors ${settings.fontFamily === font ? 'bg-blue-50 border-blue-500 text-blue-700' : 'border-slate-200 hover:bg-slate-50'}`}
+                                >
+                                    {font.replace('font-', '')}
+                                </button>
+                            ))}
+                        </div>
+                        </div>
+
+                        <div>
+                        <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 block">Theme</label>
+                        <div className="flex gap-2">
+                            <button 
+                            onClick={() => setSettings(s => ({ ...s, theme: 'light' }))}
+                            className={`flex-1 py-3 rounded-md border flex justify-center transition-all ${settings.theme === 'light' ? 'ring-2 ring-blue-500 border-transparent' : 'border-slate-200'}`}
+                            style={{ backgroundColor: '#ffffff', color: '#333' }}
+                            title="Light"
+                            >
+                            <Sun size={20} />
+                            </button>
+                            <button 
+                            onClick={() => setSettings(s => ({ ...s, theme: 'sepia' }))}
+                            className={`flex-1 py-3 rounded-md border flex justify-center transition-all ${settings.theme === 'sepia' ? 'ring-2 ring-blue-500 border-transparent' : 'border-[#e3dccb]'}`}
+                            style={{ backgroundColor: '#f4ecd8', color: '#2c2218' }}
+                            title="Sepia"
+                            >
+                            <Coffee size={20} />
+                            </button>
+                            <button 
+                            onClick={() => setSettings(s => ({ ...s, theme: 'dark' }))}
+                            className={`flex-1 py-3 rounded-md border flex justify-center transition-all ${settings.theme === 'dark' ? 'ring-2 ring-blue-500 border-transparent' : 'border-slate-700'}`}
+                            style={{ backgroundColor: '#1e293b', color: '#cbd5e1' }}
+                            title="Dark"
+                            >
+                            <Moon size={20} />
+                            </button>
+                        </div>
+                        </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                        <div>
+                            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2 block">Provider</label>
+                            <div className="grid grid-cols-2 gap-2">
+                                <button 
+                                    onClick={() => setAiSettings(s => ({ ...s, provider: 'gemini', model: 'gemini-2.5-flash' }))}
+                                    className={`py-2 px-3 text-sm border rounded-lg text-center transition-colors ${aiSettings.provider === 'gemini' ? 'bg-blue-50 border-blue-500 text-blue-700' : 'border-slate-200 hover:bg-slate-50'}`}
+                                >
+                                    Google Gemini
+                                </button>
+                                <button 
+                                    onClick={() => setAiSettings(s => ({ ...s, provider: 'openai', model: 'google/gemini-2.5-flash' }))}
+                                    className={`py-2 px-3 text-sm border rounded-lg text-center transition-colors ${aiSettings.provider === 'openai' ? 'bg-blue-50 border-blue-500 text-blue-700' : 'border-slate-200 hover:bg-slate-50'}`}
+                                >
+                                    OpenAI / Custom
+                                </button>
+                            </div>
+                        </div>
+
+                        {aiSettings.provider === 'gemini' ? (
+                             <div className="p-3 bg-blue-50 text-blue-800 text-xs rounded-lg border border-blue-100">
+                                Using system configured Gemini API Key.
+                                <div className="mt-2">
+                                    <label className="block text-[10px] font-semibold opacity-70 uppercase mb-1">Model</label>
+                                    <input 
+                                        type="text" 
+                                        value={aiSettings.model}
+                                        onChange={(e) => setAiSettings(s => ({ ...s, model: e.target.value }))}
+                                        className="w-full text-sm p-1.5 rounded border border-blue-200 bg-white"
+                                        placeholder="gemini-2.5-flash"
+                                    />
+                                </div>
+                             </div>
+                        ) : (
+                            <div className="space-y-3">
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 flex items-center gap-1">
+                                        <Server size={12} /> Base URL
+                                    </label>
+                                    <input 
+                                        type="text" 
+                                        value={aiSettings.baseUrl}
+                                        onChange={(e) => setAiSettings(s => ({ ...s, baseUrl: e.target.value }))}
+                                        placeholder="https://openrouter.ai/api/v1"
+                                        className="w-full text-sm p-2 rounded border border-slate-300 focus:border-blue-500 outline-none"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 flex items-center gap-1">
+                                        <Key size={12} /> API Key
+                                    </label>
+                                    <input 
+                                        type="password" 
+                                        value={aiSettings.apiKey}
+                                        onChange={(e) => setAiSettings(s => ({ ...s, apiKey: e.target.value }))}
+                                        placeholder="sk-..."
+                                        className="w-full text-sm p-2 rounded border border-slate-300 focus:border-blue-500 outline-none"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Model Name</label>
+                                    <input 
+                                        type="text" 
+                                        value={aiSettings.model}
+                                        onChange={(e) => setAiSettings(s => ({ ...s, model: e.target.value }))}
+                                        placeholder="google/gemini-2.5-flash"
+                                        className="w-full text-sm p-2 rounded border border-slate-300 focus:border-blue-500 outline-none"
+                                    />
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                  )}
                 </div>
 
               </div>
@@ -400,57 +769,48 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
             )}
           </div>
 
-          {/* Translate Button */}
-          <button 
-            onClick={handleTranslate}
-            disabled={isTranslating || segments.every(s => s.translatedText || s.type !== 'text')}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-all shadow-sm
-              ${isTranslating 
-                ? 'bg-slate-100 text-slate-400 cursor-not-allowed' 
-                : 'bg-blue-600 text-white hover:bg-blue-700 hover:shadow-md active:scale-95'}
-            `}
-          >
-            {isTranslating ? (
-              <>
-                <Loader2 size={16} className="animate-spin" />
-                <span className="hidden md:inline">Translating</span> {translationProgress}%
-              </>
-            ) : (
-              <>Translate <span className="hidden md:inline">Chapter</span></>
-            )}
-          </button>
+          {/* Translation Controls */}
+          {isTranslating ? (
+             <button 
+                onClick={handleStopTranslation}
+                disabled={isStopping}
+                className="relative overflow-hidden flex items-center gap-2 pl-1 pr-3 py-1 rounded-full bg-white border border-red-100 shadow-sm hover:bg-red-50 hover:border-red-200 transition-all active:scale-95 group"
+                title="Stop Translation"
+             >
+                <div className="flex items-center justify-center w-7 h-7 rounded-full bg-red-100 text-red-600 group-hover:scale-110 transition-transform">
+                   {isStopping ? <Loader2 className="animate-spin" size={14} /> : <X size={16} strokeWidth={3} />}
+                </div>
+                <div className="flex flex-col items-start leading-none">
+                   <span className="text-xs font-bold text-red-600 uppercase tracking-wide">{isStopping ? "Stopping" : "Stop"}</span>
+                </div>
+                {!isStopping && (
+                    <div className="flex items-center ml-1 pl-2 border-l border-red-100">
+                       <span className="text-xs font-mono font-medium text-red-500">{translationProgress}%</span>
+                    </div>
+                )}
+             </button>
+          ) : (
+            <button 
+              onClick={handleTranslate}
+              disabled={segments.every(s => s.translatedText || s.type !== 'text')}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-all shadow-sm
+                ${segments.every(s => s.translatedText || s.type !== 'text')
+                  ? 'bg-slate-100 text-slate-400 cursor-not-allowed' 
+                  : 'bg-blue-600 text-white hover:bg-blue-700 hover:shadow-md active:scale-95'}
+              `}
+            >
+              Translate <span className="hidden md:inline">Chapter</span>
+            </button>
+          )}
         </div>
       </header>
 
-      {/* Table of Contents Sidebar */}
-      {isTocOpen && (
-        <div className="fixed inset-0 z-50 flex">
-          <div className="absolute inset-0 bg-black/30 backdrop-blur-sm" onClick={() => setIsTocOpen(false)} />
-          <div className={`relative w-80 shadow-2xl flex flex-col h-full animate-in slide-in-from-left duration-200 ${theme.bg} ${theme.text}`}>
-            <div className={`p-4 border-b flex items-center justify-between ${theme.border}`}>
-              <h2 className="font-semibold flex items-center gap-2">
-                <List size={18} /> Table of Contents
-              </h2>
-              <button onClick={() => setIsTocOpen(false)} className={`p-1 rounded ${theme.hover}`}>
-                <X size={20} />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto py-2">
-               {book.toc.length > 0 ? (
-                 book.toc.map((item, idx) => <TocItemView key={idx} item={item} />)
-               ) : (
-                 <div className="p-4 opacity-50 text-sm text-center">
-                   No Table of Contents found.<br/>
-                   Please use the arrow buttons to navigate.
-                 </div>
-               )}
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Main Content Area */}
-      <div className="flex-1 overflow-y-auto">
+      <div 
+        className="flex-1 overflow-y-auto pt-4" 
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+      >
         <div className="max-w-[1600px] mx-auto p-6 md:p-10">
           {isLoadingChapter ? (
             <div className="flex flex-col items-center justify-center h-64 opacity-50">
@@ -469,7 +829,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
             <div className="space-y-8">
                {/* Content Rows */}
                {segments.map((segment) => (
-                 <div key={segment.id} className="flex group min-h-[2rem]">
+                 <div id={segment.id} key={segment.id} className="flex group min-h-[2rem] transition-colors duration-500 rounded-lg p-1 -m-1">
                    {/* Original Text Side */}
                    <div className="w-1/2 pr-6">
                      {segment.type === 'image' && segment.imageUrl ? (
@@ -540,6 +900,89 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ book, onBack }) => {
           )}
         </div>
       </div>
+
+      {/* Table of Contents Sidebar */}
+      {isTocOpen && (
+        <>
+          <div 
+            className="fixed inset-0 bg-black/20 backdrop-blur-[1px] z-40 animate-in fade-in duration-200"
+            onClick={() => setIsTocOpen(false)}
+          />
+          <div className={`fixed top-0 left-0 bottom-0 w-80 max-w-[80vw] z-50 shadow-2xl transform transition-transform duration-300 animate-in slide-in-from-left ${theme.bg} flex flex-col border-r ${theme.border}`}>
+            <div className={`flex items-center justify-between p-4 border-b ${theme.border}`}>
+              <h2 className="font-semibold text-lg">Table of Contents</h2>
+              <button 
+                onClick={() => setIsTocOpen(false)}
+                className={`p-2 rounded-full transition-colors ${theme.hover}`}
+              >
+                <X size={20} />
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto py-2">
+              {book.toc.length === 0 ? (
+                 <div className="p-6 text-center opacity-60 italic text-sm">
+                   No table of contents found.
+                 </div>
+              ) : (
+                 book.toc.map((item, idx) => (
+                   <TocItemView key={idx} item={item} />
+                 ))
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Search Overlay */}
+      {isSearchOpen && (
+        <div className="fixed inset-0 z-50 bg-black/20 backdrop-blur-sm flex items-start justify-center pt-20 px-4 animate-in fade-in duration-200" onClick={() => setIsSearchOpen(false)}>
+            <div 
+              className={`w-full max-w-2xl rounded-xl shadow-2xl overflow-hidden flex flex-col max-h-[70vh] ${theme.bg} border ${theme.border}`}
+              onClick={e => e.stopPropagation()}
+            >
+               <div className={`flex items-center gap-3 p-4 border-b ${theme.border}`}>
+                  <Search className="opacity-40" size={20} />
+                  <input 
+                    ref={searchInputRef}
+                    type="text" 
+                    className={`flex-1 bg-transparent border-none outline-none text-lg placeholder:opacity-40 ${theme.text}`}
+                    placeholder="Search in book..."
+                    value={searchQuery}
+                    onChange={e => setSearchQuery(e.target.value)}
+                    onKeyDown={handleSearchKeyDown}
+                  />
+                  {isSearching && <Loader2 className="animate-spin opacity-50" size={20} />}
+                  <button onClick={() => setIsSearchOpen(false)} className={`p-1 rounded-full ${theme.hover}`}><X size={20} className="opacity-50" /></button>
+               </div>
+               
+               <div className="flex-1 overflow-y-auto p-2">
+                  {searchResults.map((result, i) => (
+                      <button 
+                        key={i} 
+                        onClick={() => handleSearchResultClick(result)} 
+                        className={`w-full text-left p-3 rounded-lg mb-1 transition-colors block group ${theme.hover}`}
+                      >
+                          <div className={`text-xs opacity-50 mb-1 flex justify-between`}>
+                            <span>{result.chapterTitle}</span>
+                          </div>
+                          <div className="text-sm font-medium truncate leading-snug" dangerouslySetInnerHTML={{ __html: result.snippet.replace(new RegExp(searchQuery, 'gi'), match => `<span class="bg-yellow-200 text-slate-900 rounded px-0.5">${match}</span>`) }} />
+                      </button>
+                  ))}
+                  {!isSearching && searchResults.length === 0 && searchQuery && (
+                      <div className="p-12 text-center opacity-50">
+                        <p>No results found for "{searchQuery}"</p>
+                      </div>
+                  )}
+                  {!isSearching && !searchQuery && (
+                      <div className="p-12 text-center opacity-40 text-sm">
+                        Type to search across all chapters
+                      </div>
+                  )}
+               </div>
+            </div>
+        </div>
+      )}
     </div>
   );
 };

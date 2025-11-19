@@ -3,9 +3,11 @@ import { ParsedBook, ChapterRef, Segment, TocItem } from '../types';
 
 /**
  * Parses a raw .epub file (Blob) into a structured object.
+ * OPTIMIZED: Does NOT unzip all files. Only reads metadata and structure.
  */
-export const parseEpub = async (file: File): Promise<ParsedBook> => {
+export const parseEpub = async (file: File | Blob): Promise<ParsedBook> => {
   const zip = new JSZip();
+  // This loads the zip directory structure, but does not decompress data yet
   const loadedZip = await zip.loadAsync(file);
 
   // 1. Find the OPF file path from META-INF/container.xml
@@ -55,7 +57,7 @@ export const parseEpub = async (file: File): Promise<ParsedBook> => {
       chapters.push({
         id: idRef,
         href: fullPath,
-        title: `Chapter ${index + 1}`, // Titles are hard to extract reliably without NCX parsing, simplifying for now
+        title: `Chapter ${index + 1}`, 
         order: index
       });
     }
@@ -89,25 +91,30 @@ export const parseEpub = async (file: File): Promise<ParsedBook> => {
     }
   }
 
-  // Store all files in memory blobs for easy access
-  const files: Record<string, Blob> = {};
-  for (const fileName in loadedZip.files) {
-    const content = await loadedZip.file(fileName)?.async("blob");
-    if (content) files[fileName] = content;
+  // 4. Extract Cover Image (Only this one file is unzipped now)
+  let coverUrl: string | undefined;
+  const coverMeta = opfDoc.querySelector('meta[name="cover"]');
+  if (coverMeta) {
+      const coverId = coverMeta.getAttribute("content");
+      if (coverId && manifest[coverId]) {
+          const coverPath = opfDir + manifest[coverId];
+          const coverBlob = await loadedZip.file(coverPath)?.async("blob");
+          if (coverBlob) {
+              coverUrl = URL.createObjectURL(coverBlob);
+          }
+      }
   }
 
-  return { metadata, chapters, toc, files };
+  return { metadata, chapters, toc, coverUrl };
 };
 
-// Helper: Resolve relative paths (e.g., "../Images/img.jpg" relative to "Text/Section01.xhtml")
+// Helper: Resolve relative paths
 const resolvePath = (baseFile: string, relativePath: string): string => {
   if (!relativePath) return '';
-  
-  // Decode URI to handle %20 spaces etc
   relativePath = decodeURIComponent(relativePath);
 
   const stack = baseFile.split('/');
-  stack.pop(); // Remove current filename from base to get directory
+  stack.pop(); // Remove current filename
 
   const parts = relativePath.split('/');
   for (const part of parts) {
@@ -121,7 +128,6 @@ const resolvePath = (baseFile: string, relativePath: string): string => {
   return stack.join('/');
 };
 
-// Helper: Parse NCX XML content
 const parseNcx = (xml: string, tocPath: string): TocItem[] => {
   const parser = new DOMParser();
   const doc = parser.parseFromString(xml, "application/xml");
@@ -132,7 +138,6 @@ const parseNcx = (xml: string, tocPath: string): TocItem[] => {
     const src = content?.getAttribute("src");
     
     if (!src) return null;
-
     const fullHref = resolvePath(tocPath, src);
 
     const subitems: TocItem[] = [];
@@ -143,11 +148,7 @@ const parseNcx = (xml: string, tocPath: string): TocItem[] => {
       }
     });
 
-    return {
-      label,
-      href: fullHref,
-      subitems
-    };
+    return { label, href: fullHref, subitems };
   };
 
   const navMap = doc.querySelector("navMap");
@@ -161,33 +162,44 @@ const parseNcx = (xml: string, tocPath: string): TocItem[] => {
       }
     });
   }
-
   return items;
 };
 
 /**
- * Converts an HTML string from a chapter into a list of alignable Segments.
- * Handles Text and Images.
+ * Parses chapter content using the provided JSZip instance to load resources on demand.
+ * @param mode 'full' loads images as Blobs (UI blocking). 'text-only' skips images (faster, for search).
  */
-export const parseChapterContent = async (book: ParsedBook, chapter: ChapterRef): Promise<Segment[]> => {
-  const blob = book.files[chapter.href];
-  if (!blob) return [];
+export const parseChapterContent = async (
+    zip: JSZip, 
+    chapter: ChapterRef, 
+    mode: 'full' | 'text-only' = 'full'
+): Promise<Segment[]> => {
+  const file = zip.file(chapter.href);
+  if (!file) return [];
 
-  const text = await blob.text();
+  const text = await file.async("string");
   const parser = new DOMParser();
   const doc = parser.parseFromString(text, "application/xhtml+xml"); 
 
   const segments: Segment[] = [];
   const blockTags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'div'];
   
-  // Temporary buffer for accumulating text within a block
   let currentText = '';
   let currentTag = 'p';
+  let segmentCounter = 0;
+
+  // Map to store image tasks: segmentIndex -> imagePath
+  const pendingImages: { index: number; path: string }[] = [];
+
+  const getDeterministicId = () => {
+    segmentCounter++;
+    return `seg-${segmentCounter}`;
+  };
 
   const flushText = () => {
     if (currentText.trim().length > 0) {
       segments.push({
-        id: Math.random().toString(36).substr(2, 9),
+        id: getDeterministicId(),
         type: 'text',
         tagName: currentTag,
         originalText: currentText.trim(),
@@ -198,80 +210,71 @@ export const parseChapterContent = async (book: ParsedBook, chapter: ChapterRef)
     currentTag = 'p';
   };
 
-  const walk = (node: Node, parentTag: string) => {
+  const walk = (node: Node) => {
     if (node.nodeType === Node.TEXT_NODE) {
-      // Accumulate text
       currentText += node.textContent;
     } else if (node.nodeType === Node.ELEMENT_NODE) {
       const el = node as HTMLElement;
       const tag = el.tagName.toLowerCase();
 
+      // Image Handling
       if (tag === 'img' || tag === 'image' || tag === 'svg') {
-        // 1. Flush any pending text before the image
         flushText();
 
-        // 2. Handle Image & Resolve Source
+        // If text-only mode, we skip image processing entirely
+        if (mode === 'text-only') return;
+
         let src = el.getAttribute('src') || el.getAttribute('href');
-        
-        // Special handling for SVG wrappers (Common in Cover pages)
         if (tag === 'svg') {
             const innerImage = el.querySelector('image');
             if (innerImage) {
-                src = innerImage.getAttribute('href') || 
-                      innerImage.getAttribute('xlink:href') || 
-                      innerImage.getAttribute('src');
+                src = innerImage.getAttribute('href') || innerImage.getAttribute('xlink:href');
             }
         }
-
-        // Fallback for direct xlink:href usage on the element itself
-        if (!src) {
-            src = el.getAttribute('xlink:href');
-        }
+        if (!src) src = el.getAttribute('xlink:href');
 
         const alt = el.getAttribute('alt') || el.getAttribute('title') || 'Image';
         
         if (src) {
-           // Resolve path relative to current chapter file
            const absolutePath = resolvePath(chapter.href, src);
-           const imageBlob = book.files[absolutePath];
-           
-           if (imageBlob) {
-             const imageUrl = URL.createObjectURL(imageBlob);
-             segments.push({
-               id: Math.random().toString(36).substr(2, 9),
-               type: 'image',
-               tagName: 'img',
-               originalText: alt, // Use originalText for alt text
-               imageUrl: imageUrl,
-               isLoading: false
-             });
-           } else {
-             console.warn(`Image not found: ${absolutePath} (src: ${src})`);
-           }
+           // Push placeholder segment
+           segments.push({
+             id: getDeterministicId(),
+             type: 'image',
+             tagName: 'img',
+             originalText: alt,
+             isLoading: false
+           });
+           // Queue image load
+           pendingImages.push({ index: segments.length - 1, path: absolutePath });
         }
       } else if (blockTags.includes(tag)) {
-        // It's a block element
-        flushText(); // Flush previous content
-        
-        // Update current tag context for the upcoming text
-        currentTag = tag; 
-        
-        // Process children
-        node.childNodes.forEach(child => walk(child, tag));
-        
-        // Flush after block ends (creates the segment for this block)
+        flushText();
+        currentTag = tag;
+        node.childNodes.forEach(walk);
         flushText();
       } else if (tag === 'br') {
         currentText += '\n';
       } else {
-        // Inline elements (span, b, i, etc.) -> just traverse children
-        node.childNodes.forEach(child => walk(child, parentTag));
+        node.childNodes.forEach(walk);
       }
     }
   };
 
-  doc.body.childNodes.forEach(node => walk(node, 'div'));
-  flushText(); // Final flush
+  doc.body.childNodes.forEach(walk);
+  flushText();
+
+  // Post-process: Load images in parallel ONLY if full mode
+  if (mode === 'full') {
+    await Promise.all(pendingImages.map(async (task) => {
+        const imageBlob = await zip.file(task.path)?.async("blob");
+        if (imageBlob) {
+        segments[task.index].imageUrl = URL.createObjectURL(imageBlob);
+        } else {
+            console.warn("Image not found in zip:", task.path);
+        }
+    }));
+  }
 
   return segments;
 };
