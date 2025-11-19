@@ -1,0 +1,5 @@
+{
+  "name": "LingoBinder",
+  "description": "A dual-language EPUB reader that uses Gemini to generate side-by-side translations while preserving document structure.",
+  "requestFramePermissions": []
+}
