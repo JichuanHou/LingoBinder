@@ -1,6 +1,6 @@
 
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { ChevronLeft, ChevronRight, Globe, Loader2, ArrowLeft, List, X, AlertCircle, Settings, Minus, Plus, Moon, Sun, Coffee, Search, Server, Key, PauseCircle } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Globe, Loader2, ArrowLeft, List, X, AlertCircle, Settings, Minus, Plus, Moon, Sun, Coffee, Search, Server, Key, PauseCircle, RefreshCw } from 'lucide-react';
 import { ParsedBook, Segment, TargetLanguage, TocItem, AISettings } from '../types';
 import { parseChapterContent } from '../services/epubParser';
 import { translateSegmentsBatch } from '../services/geminiService';
@@ -43,6 +43,10 @@ const DEFAULT_AI_SETTINGS: AISettings = {
   model: 'gemini-2.5-flash'
 };
 
+const isTranslationError = (text?: string) => {
+  return text?.includes("[Translation Failed]") || text?.includes("[Error: Retry Limit Exceeded]");
+};
+
 export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, onBack }) => {
   // Book State
   const [currentChapterIndex, setCurrentChapterIndex] = useState(0);
@@ -67,6 +71,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<'view' | 'ai'>('view');
+  const [showRetranslateConfirm, setShowRetranslateConfirm] = useState(false);
 
   // Search State
   const [searchQuery, setSearchQuery] = useState('');
@@ -127,6 +132,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
     localStorage.setItem('lingo-ai-settings', JSON.stringify(aiSettings));
   }, [aiSettings]);
 
+  // Reset confirmation when translation starts or stops
+  useEffect(() => {
+    if (!isTranslating) setShowRetranslateConfirm(false);
+  }, [isTranslating]);
+
   // Auto-scroll to pending segment after segments load
   useEffect(() => {
     if (pendingScrollRef.current && !isLoadingChapter && segments.length > 0) {
@@ -173,6 +183,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
       cleanupResources(segments);
       setIsLoadingChapter(true);
       setSegments([]); 
+      setShowRetranslateConfirm(false);
       
       if (abortControllerRef.current) {
           abortControllerRef.current.abort();
@@ -225,7 +236,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
   }, []);
 
   // Translation Logic
-  const handleTranslate = useCallback(async () => {
+  const handleTranslate = useCallback(async (force: boolean = false) => {
     if (segments.length === 0) return;
     
     // Stop any existing process
@@ -241,8 +252,17 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
     setIsStopping(false);
     setTranslationProgress(0);
 
-    const segmentsToTranslate = segments.filter(s => s.type === 'text' && !s.translatedText);
+    // Filter: include segments that are untranslated OR have error messages OR if forced
+    const segmentsToTranslate = segments.filter(s => 
+      s.type === 'text' && 
+      (force || !s.translatedText || isTranslationError(s.translatedText))
+    );
     
+    if (segmentsToTranslate.length === 0) {
+        setIsTranslating(false);
+        return;
+    }
+
     const totalBatches = Math.ceil(segmentsToTranslate.length / BATCH_SIZE);
     let completedBatches = 0;
     let currentSegments = [...segments];
@@ -285,16 +305,15 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
           completedBatches++;
           setTranslationProgress(Math.round((completedBatches / totalBatches) * 100));
 
-          // Small delay between batches to breathe, unless last batch
+          // Small delay between batches
           if (i + BATCH_SIZE < segmentsToTranslate.length) {
             try {
-                // Using a loop for interruptible delay
                 for (let d = 0; d < 5; d++) { 
                     if (controller.signal.aborted) throw new Error("Aborted");
                     await new Promise(resolve => setTimeout(resolve, 100));
                 }
             } catch (e) {
-                break; // Break loop on abort
+                break; 
             }
           }
         }
@@ -526,6 +545,10 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
       )}
     </div>
   );
+
+  const canTranslate = segments.some(s => s.type === 'text' && (!s.translatedText || isTranslationError(s.translatedText)));
+  const hasErrors = segments.some(s => s.type === 'text' && isTranslationError(s.translatedText));
+  const hasTranslatedSegments = segments.some(s => s.type === 'text' && !!s.translatedText);
 
   if (!zipInstance) {
     return (
@@ -807,17 +830,47 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
                 )}
              </button>
           ) : (
-            <button 
-              onClick={handleTranslate}
-              disabled={segments.every(s => s.translatedText || s.type !== 'text')}
-              className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-all shadow-sm
-                ${segments.every(s => s.translatedText || s.type !== 'text')
-                  ? 'bg-slate-100 text-slate-400 cursor-not-allowed' 
-                  : 'bg-blue-600 text-white hover:bg-blue-700 hover:shadow-md active:scale-95'}
-              `}
-            >
-              Translate <span className="hidden md:inline">Chapter</span>
-            </button>
+             <div className="flex items-center gap-2">
+                {/* Primary Translate Action - Shows if there is work to do (gaps or errors) */}
+                {canTranslate && (
+                    <button 
+                    onClick={() => handleTranslate(false)}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium text-sm transition-all shadow-sm
+                        ${hasErrors 
+                        ? 'bg-amber-500 text-white hover:bg-amber-600 hover:shadow-md'
+                        : 'bg-blue-600 text-white hover:bg-blue-700 hover:shadow-md active:scale-95'}
+                    `}
+                    >
+                    {hasErrors ? (
+                        <>
+                        <RefreshCw size={16} /> Retry Failed
+                        </>
+                    ) : (
+                        <>
+                        Translate <span className="hidden md:inline">Chapter</span>
+                        </>
+                    )}
+                    </button>
+                )}
+
+                {/* Retranslate / Regenerate Action */}
+                {hasTranslatedSegments && (
+                    <button
+                        type="button"
+                        onClick={() => setShowRetranslateConfirm(true)}
+                        className={`flex items-center gap-2 px-3 py-2 rounded-lg font-medium text-sm transition-all border
+                             ${!canTranslate 
+                                ? 'bg-white border-slate-300 text-slate-700 hover:bg-slate-50 shadow-sm' // Main action style when fully translated
+                                : 'border-transparent text-slate-500 hover:bg-slate-100 hover:text-slate-700' // Secondary action style
+                             }
+                        `}
+                        title="Retranslate entire chapter"
+                    >
+                        <RefreshCw size={16} />
+                        {!canTranslate ? "Retranslate Chapter" : null}
+                    </button>
+                )}
+            </div>
           )}
         </div>
       </header>
@@ -875,6 +928,18 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
                        <div className="h-full flex items-center opacity-50 animate-pulse">
                          <span className={`text-xs rounded px-2 py-1 border ${theme.border}`}>Translating...</span>
                        </div>
+                     ) : isTranslationError(segment.translatedText) ? (
+                        <div className="flex flex-col items-start gap-2 text-red-600">
+                            <span className="text-sm font-medium flex items-center gap-2">
+                                <AlertCircle size={14} /> {segment.translatedText}
+                            </span>
+                            <button 
+                                onClick={(e) => { e.stopPropagation(); handleTranslate(); }}
+                                className="text-xs bg-red-50 hover:bg-red-100 border border-red-200 px-2 py-1 rounded flex items-center gap-1 transition-colors"
+                            >
+                                <RefreshCw size={10} /> Retry
+                            </button>
+                        </div>
                      ) : segment.translatedText ? (
                         <div 
                            className={`${getTagStyles(segment.tagName)} ${settings.fontFamily} ${theme.text}`}
@@ -997,6 +1062,39 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
                       </div>
                   )}
                </div>
+            </div>
+        </div>
+      )}
+
+      {/* Retranslate Confirmation Modal */}
+      {showRetranslateConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div 
+                className="absolute inset-0 bg-black/30 backdrop-blur-sm" 
+                onClick={() => setShowRetranslateConfirm(false)} 
+            />
+            <div className="relative bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm border border-slate-100 scale-100 animate-in zoom-in-95 duration-200">
+                <h3 className="text-lg font-bold text-slate-800 mb-2">Retranslate Chapter?</h3>
+                <p className="text-slate-600 mb-6 leading-relaxed">
+                    This will overwrite all existing translations in this chapter. Are you sure?
+                </p>
+                <div className="flex justify-end gap-3">
+                    <button 
+                        onClick={() => setShowRetranslateConfirm(false)} 
+                        className="px-4 py-2 text-slate-600 font-medium hover:bg-slate-100 rounded-lg transition-colors"
+                    >
+                        Cancel
+                    </button>
+                    <button 
+                        onClick={() => {
+                            handleTranslate(true);
+                            setShowRetranslateConfirm(false);
+                        }} 
+                        className="px-4 py-2 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors shadow-sm flex items-center gap-2"
+                    >
+                        <RefreshCw size={16} /> Retranslate
+                    </button>
+                </div>
             </div>
         </div>
       )}
