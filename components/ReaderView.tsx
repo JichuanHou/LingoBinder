@@ -59,7 +59,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
   const searchInputRef = useRef<HTMLInputElement>(null);
   const pendingScrollRef = useRef<string | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const saveTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // UI State
@@ -709,15 +709,32 @@ export const ReaderView: React.FC<ReaderViewProps> = ({ bookId, book, epubFile, 
                         </div>
 
                         {aiSettings.provider === 'gemini' ? (
-                             <div className="p-3 bg-blue-50 text-blue-800 text-xs rounded-lg border border-blue-100">
-                                Using system configured Gemini API Key.
-                                <div className="mt-2">
-                                    <label className="block text-[10px] font-semibold opacity-70 uppercase mb-1">Model</label>
+                             <div className="space-y-4">
+                                <div className="p-3 bg-blue-50 text-blue-800 text-xs rounded-lg border border-blue-100">
+                                   <p className="font-medium mb-1">Using Google Gemini</p>
+                                   <p className="opacity-80">Leave API Key empty to use the system default key.</p>
+                                </div>
+                                
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 flex items-center gap-1">
+                                        <Key size={12} /> API Key (Optional)
+                                    </label>
+                                    <input 
+                                        type="password" 
+                                        value={aiSettings.apiKey}
+                                        onChange={(e) => setAiSettings(s => ({ ...s, apiKey: e.target.value }))}
+                                        placeholder="Use system default or enter key"
+                                        className="w-full text-sm p-2 rounded border border-slate-300 focus:border-blue-500 outline-none"
+                                    />
+                                </div>
+
+                                <div>
+                                    <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1 block">Model Name</label>
                                     <input 
                                         type="text" 
                                         value={aiSettings.model}
                                         onChange={(e) => setAiSettings(s => ({ ...s, model: e.target.value }))}
-                                        className="w-full text-sm p-1.5 rounded border border-blue-200 bg-white"
+                                        className="w-full text-sm p-2 rounded border border-slate-300 focus:border-blue-500 outline-none"
                                         placeholder="gemini-2.5-flash"
                                     />
                                 </div>

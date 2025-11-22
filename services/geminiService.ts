@@ -2,12 +2,12 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { TargetLanguage, AISettings } from "../types";
 
-const getAiClient = () => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey) {
-    throw new Error("API_KEY is missing from environment variables.");
+const getAiClient = (apiKey?: string) => {
+  const key = apiKey || process.env.API_KEY;
+  if (!key) {
+    throw new Error("API_KEY is missing. Please provide one in settings.");
   }
-  return new GoogleGenAI({ apiKey });
+  return new GoogleGenAI({ apiKey: key });
 };
 
 const delay = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
@@ -32,9 +32,10 @@ const translateWithGemini = async (
   texts: string[],
   targetLanguage: TargetLanguage,
   modelName: string,
+  apiKey?: string,
   signal?: AbortSignal
 ): Promise<string[]> => {
-  const ai = getAiClient();
+  const ai = getAiClient(apiKey);
   
   // Ensure we use a valid Gemini model name
   const safeModel = modelName.includes('gemini') ? modelName : "gemini-2.5-flash";
@@ -160,7 +161,8 @@ export const translateSegmentsBatch = async (
       if (settings.provider === 'openai') {
         return await translateWithOpenAI(texts, targetLanguage, settings, signal);
       } else {
-        return await translateWithGemini(texts, targetLanguage, settings.model, signal);
+        // Pass the apiKey from settings to Gemini function
+        return await translateWithGemini(texts, targetLanguage, settings.model, settings.apiKey, signal);
       }
     } catch (error: any) {
       if (signal?.aborted || error.message === "Aborted" || error.name === 'AbortError') {
